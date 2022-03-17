@@ -1,9 +1,10 @@
 // An ACME client that requests issuance of a certificate using a SHA-1 signed
 // and a redirect to an HTTPS server that offers only TLS 1.0 and TLS 1.1.
 //
-// To run against a local Boulder:
+// To run against a local Boulder, edit docker-compose.yml to change FAKEDNS to 172.17.0.1 (your host IP) and run:
 //
-//  go run oddclient.go -dirurl http://boulder:4001/directory -domains ${RANDOM}-example.com -httpListen :5002 -httpsListen :5001
+// docker-compose up
+// go run oddclient.go -dirurl http://boulder:4001/directory -domains ${RANDOM}-example.com -httpListen :5002 -httpsListen :5001
 //
 // To run against a public ACME server, set up a host with wildcard DNS pointed at it and run:
 //
@@ -41,6 +42,8 @@ import (
 
 var (
 	domains      string
+	baseDomain   string
+	issuePath    string
 	directoryUrl string
 	contactsList string
 	accountFile  string
@@ -54,8 +57,31 @@ type acmeAccountFile struct {
 }
 
 func main() {
-	if err := main2(os.Stdout); err != nil {
-		log.Fatal(err)
+	flag.StringVar(&directoryUrl, "dirurl", acme.LetsEncryptStaging,
+		"acme directory url - defaults to lets encrypt v2 staging url if not provided")
+	flag.StringVar(&contactsList, "contact", "",
+		"a list of comma separated contact emails to use when creating a new account (optional, dont include 'mailto:' prefix)")
+	flag.StringVar(&domains, "domains", "",
+		"a comma separated list of domains to issue a certificate for")
+	flag.StringVar(&baseDomain, "baseDomain", "",
+		"a domain name under which to issue for subdomains, e.g. 'example.com'")
+	flag.StringVar(&accountFile, "accountfile", "account.json",
+		"the file that the account json data will be saved to/loaded from (will create new file if not exists)")
+	flag.StringVar(&issuePath, "issuePath", "",
+		"POST to this path to trigger an issuance")
+	flag.StringVar(&httpListen, "httpListen", ":80", "Port on which to listen for HTTP")
+	flag.StringVar(&httpsListen, "httpsListen", ":443", "Port on which to listen for HTTPS")
+	flag.Parse()
+
+	go redirectServer(httpListen)
+	go challengeServer(httpsListen)
+
+	if domains != "" {
+		if err := issue(os.Stdout, strings.Split(domains, ",")); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		select {}
 	}
 }
 
@@ -67,6 +93,8 @@ type challengeResponder struct {
 	// Map from a challenge token path to its contents
 	challenges map[string]string
 }
+
+const ACME_CHALLENGE_PREFIX = "/.well-known/acme-challenge/"
 
 // Serve challenge responses via HTTPS with a self-signed certificate. Never returns.
 func challengeServer(addr string) {
@@ -94,10 +122,9 @@ func challengeServer(addr string) {
 		MaxVersion: tls.VersionTLS11,
 	}
 
-	srv := &http.Server{
-		Addr:      addr,
-		TLSConfig: &tlsConfig,
-		Handler: http.StripPrefix("/.well-known/acme-challenge/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.Handle(ACME_CHALLENGE_PREFIX,
+		http.StripPrefix(ACME_CHALLENGE_PREFIX, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			servables.Lock()
 			defer servables.Unlock()
 			challengeResponse := servables.challenges[r.URL.Path]
@@ -107,42 +134,59 @@ func challengeServer(addr string) {
 			} else {
 				_, _ = w.Write([]byte(challengeResponse))
 			}
-		})),
+		})))
+
+	srv := &http.Server{
+		Addr:      addr,
+		TLSConfig: &tlsConfig,
+		Handler:   mux,
 	}
 	log.Fatal(srv.ListenAndServeTLS("", ""))
 }
 
-// Redirect all requests to their HTTPS equivalent. Never returns.
+// Redirect all ACME challenge requests to their HTTPS equivalent. Never returns.
 func redirectServer(addr string) {
+	mux := http.NewServeMux()
+	mux.Handle("/request-a-cert", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(401)
+			fmt.Fprintf(w, "Use POST")
+			return
+		}
+		if baseDomain == "" {
+			w.WriteHeader(500)
+			fmt.Fprintf(w, "No base domain configured. Start server with -baseDomain\n")
+			return
+		}
+		var subdomain [4]byte
+		_, err := rand.Reader.Read(subdomain[:])
+		if err != nil {
+			w.WriteHeader(500)
+			fmt.Fprintf(w, "Error getting randomness??\n")
+			return
+		}
+		hostname := fmt.Sprintf("%x.%s", subdomain, baseDomain)
+		err = issue(w, []string{hostname})
+		if err != nil {
+			fmt.Fprintf(w, "error: %s", err)
+		}
+	}))
+
+	mux.Handle(ACME_CHALLENGE_PREFIX, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.URL.Scheme = "https"
+		w.Header().Set("Location", fmt.Sprintf("https://%s%s", r.Host, r.URL.Path))
+		w.WriteHeader(302)
+	}))
+
 	s := &http.Server{
-		Addr: addr,
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			r.URL.Scheme = "https"
-			w.Header().Set("Location", fmt.Sprintf("https://%s%s", r.Host, r.URL.Path))
-			w.WriteHeader(302)
-		}),
+		Addr:    addr,
+		Handler: mux,
 	}
 	log.Fatal(s.ListenAndServe())
 }
 
-func main2(w io.Writer) error {
-	flag.StringVar(&directoryUrl, "dirurl", acme.LetsEncryptStaging,
-		"acme directory url - defaults to lets encrypt v2 staging url if not provided")
-	flag.StringVar(&contactsList, "contact", "",
-		"a list of comma separated contact emails to use when creating a new account (optional, dont include 'mailto:' prefix)")
-	flag.StringVar(&domains, "domains", "",
-		"a comma separated list of domains to issue a certificate for")
-	flag.StringVar(&accountFile, "accountfile", "account.json",
-		"the file that the account json data will be saved to/loaded from (will create new file if not exists)")
-	flag.StringVar(&httpListen, "httpListen", ":80", "Port on which to listen for HTTP")
-	flag.StringVar(&httpsListen, "httpsListen", ":443", "Port on which to listen for HTTPS")
-	flag.Parse()
-
-	go redirectServer(httpListen)
-	go challengeServer(httpsListen)
-
-	// check domains are provided
-	if domains == "" {
+func issue(w io.Writer, domains []string) error {
+	if len(domains) == 0 {
 		return fmt.Errorf("no domains provided")
 	}
 
@@ -167,15 +211,13 @@ func main2(w io.Writer) error {
 	}
 	fmt.Fprintf(w, "Account url: %s\n", account.URL)
 
-	// collect the comma separated domains into acme identifiers
-	domainList := strings.Split(domains, ",")
 	var ids []acme.Identifier
-	for _, domain := range domainList {
+	for _, domain := range domains {
 		ids = append(ids, acme.Identifier{Type: "dns", Value: domain})
 	}
 
 	// create a new order with the acme service given the provided identifiers
-	fmt.Fprintf(w, "Creating new order for domains: %s\n", domainList)
+	fmt.Fprintf(w, "Creating new order for domains: %s\n", domains)
 	order, err := client.NewOrder(account, ids)
 	if err != nil {
 		return fmt.Errorf("creating new order: %s", err)
@@ -239,8 +281,8 @@ func main2(w io.Writer) error {
 		SignatureAlgorithm: x509.SHA1WithRSA,
 		PublicKeyAlgorithm: x509.RSA,
 		PublicKey:          certKey.Public(),
-		Subject:            pkix.Name{CommonName: domainList[0]},
-		DNSNames:           domainList,
+		Subject:            pkix.Name{CommonName: domains[0]},
+		DNSNames:           domains,
 	}
 	csrDer, err := x509.CreateCertificateRequest(rand.Reader, tpl, certKey)
 	if err != nil {
