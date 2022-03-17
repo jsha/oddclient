@@ -14,12 +14,15 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -29,6 +32,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -45,8 +49,6 @@ var (
 	baseDomain   string
 	issuePath    string
 	directoryUrl string
-	contactsList string
-	accountFile  string
 	httpListen   string
 	httpsListen  string
 )
@@ -59,14 +61,10 @@ type acmeAccountFile struct {
 func main() {
 	flag.StringVar(&directoryUrl, "dirurl", acme.LetsEncryptStaging,
 		"acme directory url - defaults to lets encrypt v2 staging url if not provided")
-	flag.StringVar(&contactsList, "contact", "",
-		"a list of comma separated contact emails to use when creating a new account (optional, dont include 'mailto:' prefix)")
 	flag.StringVar(&domains, "domains", "",
 		"a comma separated list of domains to issue a certificate for")
 	flag.StringVar(&baseDomain, "baseDomain", "",
 		"a domain name under which to issue for subdomains, e.g. 'example.com'")
-	flag.StringVar(&accountFile, "accountfile", "account.json",
-		"the file that the account json data will be saved to/loaded from (will create new file if not exists)")
 	flag.StringVar(&issuePath, "issuePath", "",
 		"POST to this path to trigger an issuance")
 	flag.StringVar(&httpListen, "httpListen", ":80", "Port on which to listen for HTTP")
@@ -77,10 +75,11 @@ func main() {
 	go challengeServer(httpsListen)
 
 	if domains != "" {
-		if err := issue(os.Stdout, strings.Split(domains, ",")); err != nil {
+		if err := issue(os.Stdout, strings.Split(domains, ","), directoryUrl, SHA1TLS1); err != nil {
 			log.Fatal(err)
 		}
 	} else {
+		// Wait for issuance requests via HTTP; shut down on SIGTERM
 		select {}
 	}
 }
@@ -153,23 +152,54 @@ func redirectServer(addr string) {
 			fmt.Fprintf(w, "Use POST")
 			return
 		}
+
+		body, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(500)
+			fmt.Fprintf(w, "Error reading body: %s\n", err)
+			return
+		}
+		components := strings.Split(string(body), ";")
+		if len(components) != 2 {
+			w.WriteHeader(500)
+			fmt.Fprintf(w, "Invalid POST body. Expected '<profile>;<directory url>, got %q\n", body)
+			return
+		}
+		directoryUrl = components[1]
+		profile, ok := profiles[components[0]]
+		if !ok {
+			w.WriteHeader(401)
+			fmt.Fprintf(w, "Unrecognized profile %q\n", components[0])
+		}
+
 		if baseDomain == "" {
 			w.WriteHeader(500)
 			fmt.Fprintf(w, "No base domain configured. Start server with -baseDomain\n")
 			return
 		}
 		var subdomain [4]byte
-		_, err := rand.Reader.Read(subdomain[:])
+		_, err = rand.Reader.Read(subdomain[:])
 		if err != nil {
 			w.WriteHeader(500)
-			fmt.Fprintf(w, "Error getting randomness??\n")
+			fmt.Fprintf(w, "Error getting randomness: %s\n", err)
 			return
 		}
 		hostname := fmt.Sprintf("%x.%s", subdomain, baseDomain)
-		err = issue(w, []string{hostname})
+
+		var buf bytes.Buffer
+		err = issue(&buf, []string{hostname}, directoryUrl, profile)
 		if err != nil {
-			fmt.Fprintf(w, "error: %s", err)
+			var prob acme.Problem
+			if errors.As(err, &prob) {
+				w.WriteHeader(prob.Status)
+			} else {
+				w.WriteHeader(500)
+			}
+			_, _ = w.Write(buf.Bytes())
+			fmt.Fprintf(w, "error: %s\n", err)
+			return
 		}
+		_, _ = w.Write(buf.Bytes())
 	}))
 
 	mux.Handle(ACME_CHALLENGE_PREFIX, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -185,31 +215,54 @@ func redirectServer(addr string) {
 	log.Fatal(s.ListenAndServe())
 }
 
-func issue(w io.Writer, domains []string) error {
+type Profile int
+
+const (
+	TLS1 Profile = iota
+	SHA1TLS1
+)
+
+var profiles = map[string]Profile{
+	"sha1tls1": SHA1TLS1,
+	"tls1":     TLS1,
+}
+
+type timestampWriter struct {
+	io.Writer
+}
+
+func (tw timestampWriter) Write(b []byte) (int, error) {
+	return fmt.Fprintf(tw.Writer, "%s: %s\n", time.Now().UTC().Format("2006-01-02T15:04:05.999Z"), string(b))
+}
+
+func issue(w io.Writer, domains []string, directoryURL string, profile Profile) error {
+	w = timestampWriter{w}
 	if len(domains) == 0 {
 		return fmt.Errorf("no domains provided")
 	}
 
 	// create a new acme client given a provided (or default) directory url
-	fmt.Printf("Connecting to acme directory url: %s\n", directoryUrl)
-	client, err := acme.NewClient(directoryUrl)
+	fmt.Fprintf(w, "Connecting to acme directory url: %s", directoryURL)
+	client, err := acme.NewClient(directoryURL)
 	if err != nil {
 		return fmt.Errorf("connecting to acme directory: %w", err)
 	}
 
+	accountFile := base64.RawURLEncoding.EncodeToString([]byte(directoryURL)) + ".account.json"
+
 	// attempt to load an existing account from file
-	fmt.Fprintf(w, "Loading account file %s\n", accountFile)
-	account, err := loadAccount(client)
+	fmt.Fprintf(w, "Loading account file %s", accountFile)
+	account, err := loadAccount(client, accountFile)
 	if err != nil {
 		fmt.Fprintf(w, "loading existing account: %s", err)
 		// if there was an error loading an account, just create a new one
-		fmt.Fprintf(w, "Creating new account\n")
-		account, err = createAccount(client)
+		fmt.Fprintf(w, "Creating new account")
+		account, err = createAccount(client, accountFile)
 		if err != nil {
 			return fmt.Errorf("creating new account: %w", err)
 		}
 	}
-	fmt.Fprintf(w, "Account url: %s\n", account.URL)
+	fmt.Fprintf(w, "Account url: %s", account.URL)
 
 	var ids []acme.Identifier
 	for _, domain := range domains {
@@ -217,22 +270,22 @@ func issue(w io.Writer, domains []string) error {
 	}
 
 	// create a new order with the acme service given the provided identifiers
-	fmt.Fprintf(w, "Creating new order for domains: %s\n", domains)
+	fmt.Fprintf(w, "Creating new order for domains: %s", domains)
 	order, err := client.NewOrder(account, ids)
 	if err != nil {
 		return fmt.Errorf("creating new order: %s", err)
 	}
-	fmt.Fprintf(w, "Order created: %s\n", order.URL)
+	fmt.Fprintf(w, "Order created: %s", order.URL)
 
 	// loop through each of the provided authorization urls
 	for _, authUrl := range order.Authorizations {
 		// fetch the authorization data from the acme service given the provided authorization url
-		fmt.Fprintf(w, "Fetching authorization: %s\n", authUrl)
+		fmt.Fprintf(w, "Fetching authorization: %s", authUrl)
 		auth, err := client.FetchAuthorization(account, authUrl)
 		if err != nil {
 			return fmt.Errorf("fetching authorization url %q: %w", authUrl, err)
 		}
-		fmt.Fprintf(w, "Fetched authorization: %s\n", auth.Identifier.Value)
+		fmt.Fprintf(w, "Fetched authorization: %s", auth.Identifier.Value)
 
 		// grab a http-01 challenge from the authorization if it exists
 		chal, ok := auth.ChallengeMap[acme.ChallengeTypeHTTP01]
@@ -241,7 +294,7 @@ func issue(w io.Writer, domains []string) error {
 		}
 
 		// create the challenge token file with the key authorization from the challenge
-		fmt.Fprintf(w, "Preparing to serve challenge: %s\n", chal.Token)
+		fmt.Fprintf(w, "Preparing to serve challenge: %s", chal.Token)
 		servables.Lock()
 		servables.challenges[chal.Token] = chal.KeyAuthorization
 		servables.Unlock()
@@ -258,27 +311,31 @@ func issue(w io.Writer, domains []string) error {
 		*/
 
 		// update the acme server that the challenge file is ready to be queried
-		fmt.Fprintf(w, "Updating challenge for authorization %s: %s\n", auth.Identifier.Value, chal.URL)
+		fmt.Fprintf(w, "Updating challenge for authorization %s: %s", auth.Identifier.Value, chal.URL)
 		chal, err = client.UpdateChallenge(account, chal)
 		if err != nil {
 			return fmt.Errorf("updating authorization %s challenge: %w", auth.Identifier.Value, err)
 		}
-		fmt.Fprintf(w, "Challenge updated\n")
+		fmt.Fprintf(w, "Challenge updated")
 	}
 
 	// all the challenges should now be completed
 
 	// create a csr for the new certificate
-	fmt.Fprintf(w, "Generating certificate private key\n")
+	fmt.Fprintf(w, "Generating certificate private key")
 	certKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return fmt.Errorf("generating certificate key: %w", err)
 	}
 
+	signatureAlgorithm := x509.SHA256WithRSA
+	if profile == SHA1TLS1 {
+		signatureAlgorithm = x509.SHA1WithRSA
+	}
 	// create the new csr template
-	fmt.Fprintf(w, "Creating csr\n")
+	fmt.Fprintf(w, "Creating csr")
 	tpl := &x509.CertificateRequest{
-		SignatureAlgorithm: x509.SHA1WithRSA,
+		SignatureAlgorithm: signatureAlgorithm,
 		PublicKeyAlgorithm: x509.RSA,
 		PublicKey:          certKey.Public(),
 		Subject:            pkix.Name{CommonName: domains[0]},
@@ -294,39 +351,39 @@ func issue(w io.Writer, domains []string) error {
 	}
 
 	// finalize the order with the acme server given a csr
-	fmt.Fprintf(w, "Finalising order: %s\n", order.URL)
+	fmt.Fprintf(w, "Finalising order: %s", order.URL)
 	order, err = client.FinalizeOrder(account, order, csr)
 	if err != nil {
 		return fmt.Errorf("finalizing order: %w", err)
 	}
 
-	fmt.Fprintf(w, "Certificate issued: %s\n", order.Certificate)
-	fmt.Fprintf(w, "Done.\n")
+	fmt.Fprintf(w, "Certificate issued: %s", order.Certificate)
+	fmt.Fprintf(w, "Done.")
 	return nil
 }
 
-func loadAccount(client acme.Client) (acme.Account, error) {
+func loadAccount(client acme.Client, accountFile string) (acme.Account, error) {
 	raw, err := ioutil.ReadFile(accountFile)
 	if err != nil {
-		return acme.Account{}, fmt.Errorf("error reading account file %q: %v", accountFile, err)
+		return acme.Account{}, fmt.Errorf("error reading account file %q: %w", accountFile, err)
 	}
 	var aaf acmeAccountFile
 	if err := json.Unmarshal(raw, &aaf); err != nil {
-		return acme.Account{}, fmt.Errorf("error parsing account file %q: %v", accountFile, err)
+		return acme.Account{}, fmt.Errorf("error parsing account file %q: %w", accountFile, err)
 	}
-	account, err := client.UpdateAccount(acme.Account{PrivateKey: pem2key([]byte(aaf.PrivateKey)), URL: aaf.Url}, getContacts()...)
+	account, err := client.UpdateAccount(acme.Account{PrivateKey: pem2key([]byte(aaf.PrivateKey)), URL: aaf.Url})
 	if err != nil {
-		return acme.Account{}, fmt.Errorf("error updating existing account: %v", err)
+		return acme.Account{}, fmt.Errorf("error updating existing account: %w", err)
 	}
 	return account, nil
 }
 
-func createAccount(client acme.Client) (acme.Account, error) {
+func createAccount(client acme.Client, accountFile string) (acme.Account, error) {
 	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return acme.Account{}, fmt.Errorf("error creating private key: %v", err)
 	}
-	account, err := client.NewAccount(privKey, false, true, getContacts()...)
+	account, err := client.NewAccount(privKey, false, true)
 	if err != nil {
 		return acme.Account{}, fmt.Errorf("error creating new account: %v", err)
 	}
@@ -338,17 +395,6 @@ func createAccount(client acme.Client) (acme.Account, error) {
 		return acme.Account{}, fmt.Errorf("error creating account file: %v", err)
 	}
 	return account, nil
-}
-
-func getContacts() []string {
-	var contacts []string
-	if contactsList != "" {
-		contacts = strings.Split(contactsList, ",")
-		for i := 0; i < len(contacts); i++ {
-			contacts[i] = "mailto:" + contacts[i]
-		}
-	}
-	return contacts
 }
 
 func key2pem(certKey *ecdsa.PrivateKey) []byte {
